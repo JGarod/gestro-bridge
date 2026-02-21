@@ -1,0 +1,24 @@
+{
+  "name": "gestro-bridge",
+  "version": "1.0.0",
+  "description": "Gestro Bridge - Puente de impresión local",
+  "main": "gestro-bridge.js",
+  "scripts": {
+    "start": "node gestro-bridge.js",
+    "build": "npx pkg gestro-bridge.js --target node18-win-x64 --output dist/GestroBridge.exe --icon icon.ico"
+  },
+  "pkg": {
+    "assets": [
+      "icon.ico"
+    ],
+    "targets": [
+      "node18-win-x64"
+    ]
+  },
+  "dependencies": {
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  }
+}
