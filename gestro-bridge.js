@@ -80,6 +80,9 @@ const HTML = `<!DOCTYPE html>
   .logs { font-family: monospace; font-size: 0.8rem; color: #94a3b8; line-height: 1.8; max-height: 250px; overflow-y: auto; background: #0f172a; padding: 1rem; border-radius: 0.8rem; }
   .logs span { display: block; border-bottom: 1px solid #1e293b; padding: 0.2rem 0; }
   .logs span.ok { color: #10b981; } .logs span.warn { color: #f87171; } .logs span.info { color: #6366f1; }
+  .btn-rescan { background: #6366f1; color: white; border: none; padding: 0.5rem 1rem; border-radius: 0.6rem; font-size: 0.8rem; font-weight: 700; cursor: pointer; transition: 0.2s; }
+  .btn-rescan:hover { background: #8b5cf6; }
+  .btn-rescan:disabled { opacity: 0.5; }
 </style>
 </head>
 <body>
@@ -99,7 +102,10 @@ const HTML = `<!DOCTYPE html>
     </div>
   </div>
   <div class="card" id="printers-card" style="display:none">
-    <h2>Impresoras en Red</h2>
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 1rem;">
+      <h2 style="margin:0">Impresoras en Red</h2>
+      <button id="rescan-btn" onclick="rescan()" class="btn-rescan">Actualizar lista</button>
+    </div>
     <div class="printers-grid" id="printers-grid"><p>Escaneando...</p></div>
   </div>
   <div class="card">
@@ -109,6 +115,17 @@ const HTML = `<!DOCTYPE html>
 </div>
 <script>
 let polling = setInterval(updateStatus, 1500);
+async function rescan() {
+  const btn = document.getElementById('rescan-btn');
+  btn.disabled = true; btn.textContent = 'Buscando...';
+  try {
+    await fetch('/api/rescan', { method: 'POST' });
+    setTimeout(() => { 
+        btn.disabled = false; btn.textContent = 'Actualizar lista'; 
+        updateStatus(); 
+    }, 2000);
+  } catch(e) { btn.disabled = false; btn.textContent = 'Actualizar lista'; }
+}
 async function doLogin() {
   const btn = document.getElementById('login-btn');
   const err = document.getElementById('error-msg');
@@ -165,6 +182,13 @@ const uiServer = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify(status));
   }
+  if (req.method === 'POST' && req.url === '/api/rescan') {
+    triggerPrinterSync();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/api/login') {
     let body = '';
     req.on('data', c => body += c);
@@ -215,12 +239,7 @@ function initSocket() {
 
       // Solo escaneamos si es la conexión inicial para evitar bucles
       if (isInitialAuth) {
-        scanLocalSubnet().then(found => {
-          if (found.length > 0) {
-            addLog(`Registrando ${found.length} impresoras nuevas encontradas...`);
-            socket.emit('registerPrinters', { printers: found, locationId: config.LOCATION_ID });
-          }
-        });
+        triggerPrinterSync();
       }
     } else {
       addLog(`[ERROR] ${data.message}`);
@@ -230,8 +249,15 @@ function initSocket() {
 
   socket.on('printersRegistered', (data) => {
     status.printers = data.printers || [];
-    addLog(`[OK] Lista de impresoras actualizada (${status.printers.length}).`);
+    addLog(`[OK] Lista de impresoras sincronizada (${status.printers.length} activas).`);
   });
+
+  async function triggerPrinterSync() {
+    addLog(`Iniciando escaneo de red local...`);
+    const found = await scanLocalSubnet();
+    addLog(`Escaneo finalizado. Sincronizando ${found.length} impresoras con Gestro...`);
+    socket.emit('registerPrinters', { printers: found, locationId: config.LOCATION_ID });
+  }
 
   socket.on('print-job', (data) => {
     addLog(`Imprimiendo orden...`);
@@ -252,32 +278,48 @@ async function scanLocalSubnet() {
   const interfaces = os.networkInterfaces();
   const discovered = [];
   const promises = [];
-  promises.push(checkPort('127.0.0.1').then(ok => { if (ok) discovered.push({ ip: '127.0.0.1', port: 9100, name: 'Local' }); }));
-  for (const ifaces of Object.values(interfaces)) {
+  const COMMON_PORTS = [9100, 9101]; // Industry standard for POS printers
+
+  // Localhost test
+  promises.push(checkPort('127.0.0.1', 9100).then(ok => { if (ok) discovered.push({ ip: '127.0.0.1', port: 9100, name: 'Local' }); }));
+
+  for (const [name, ifaces] of Object.entries(interfaces)) {
     for (const iface of ifaces) {
       if (iface.family === 'IPv4' && !iface.internal) {
         const myIp = iface.address;
         const prefix = myIp.split('.').slice(0, 3).join('.') + '.';
+        addLog(`Escaneando segmento ${prefix}x...`);
+
         for (let i = 1; i < 255; i++) {
           const ip = prefix + i;
-          if (ip === myIp) continue; // Saltamos nuestra propia IP local ya que escaneamos 127.0.0.1
-          promises.push(checkPort(ip).then(ok => { if (ok) discovered.push({ ip, port: 9100, name: `IP ${ip}` }); }));
+          if (ip === myIp) continue;
+
+          COMMON_PORTS.forEach(port => {
+            promises.push(checkPort(ip, port).then(ok => {
+              if (ok) {
+                addLog(`[OK] Impresora detectada en ${ip}:${port}`);
+                discovered.push({ ip, port, name: `Impresora ${ip}` });
+              }
+            }));
+          });
         }
       }
     }
   }
+
+  // Wait for all checks with a total timeout protection
   await Promise.allSettled(promises);
   return discovered;
 }
 
-function checkPort(ip) {
+function checkPort(ip, port = 9100) {
   return new Promise(resolve => {
     const s = new net.Socket();
-    s.setTimeout(1000);
+    s.setTimeout(1200); // Slightly more time for slow networks
     s.on('connect', () => { s.destroy(); resolve(true); });
     s.on('error', () => { s.destroy(); resolve(false); });
     s.on('timeout', () => { s.destroy(); resolve(false); });
-    s.connect(9100, ip);
+    s.connect(port, ip);
   });
 }
 
