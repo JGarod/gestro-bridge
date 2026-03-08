@@ -27,11 +27,25 @@ process.on('SIGINT', askReadyToExit);  // Ctrl+C
 process.on('SIGHUP', askReadyToExit);  // Cierre de ventana / Alt+F4
 process.on('SIGTERM', askReadyToExit); // Terminación genérica
 
+// Captura de errores no controlados para evitar que la consola se cierre sin explicación
+process.on('uncaughtException', (err) => {
+  console.error('\n\x1b[31m[ERROR FATAL]\x1b[0m Excepción no capturada:', err.message);
+  console.error(err.stack);
+  fs.appendFileSync('./bridge-error.log', `[${new Date().toISOString()}] UNCAUGHT EXCEPTION: ${err.stack}\n`);
+  // No salimos inmediatamente para intentar registrar el log
+  setTimeout(() => process.exit(1), 1000);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('\n\x1b[31m[PROCESO RECHAZADO]\x1b[0m Promesa no controlada en:', promise, 'razón:', reason);
+  fs.appendFileSync('./bridge-error.log', `[${new Date().toISOString()}] UNHANDLED REJECTION: ${reason}\n`);
+});
+
 // ──────────────────────────────────────────────────
 //  CONFIGURACIÓN (el desarrollador ajusta esto)
 // ──────────────────────────────────────────────────
-const SERVER_URL = 'https://backend-restaurante-a.vhrt6n.easypanel.host';   // IP del servidor según environment.ts
-const LOCATION_ID = 'b4acea5b-6bfd-410d-a951-6618e2800be1';
+const SERVER_URL = 'https://backend-restaurante-d.vhrt6n.easypanel.host';   // IP del servidor según environment.ts
+const LOCATION_ID = '46630434-6258-4a76-ac1b-b12c209aa406';
 const UI_PORT = 8080;
 // ──────────────────────────────────────────────────
 
@@ -210,7 +224,14 @@ const uiServer = http.createServer(async (req, res) => {
 function initSocket() {
   if (socket) return;
   addLog(`Conectando a ${config.SERVER_URL}...`);
-  socket = io(config.SERVER_URL, { reconnectionAttempts: 5, timeout: 5000 });
+  // Configuración de reconexión infinita para máxima estabilidad
+  socket = io(config.SERVER_URL, {
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 2000,
+    reconnectionDelayMax: 10000,
+    timeout: 10000
+  });
 
   socket.on('connect', () => {
     addLog(`[OK] Conexión física establecida.`);
@@ -226,7 +247,18 @@ function initSocket() {
 
   socket.on('connect_error', (err) => {
     status.error = "Error de conexión con el servidor Gestro";
-    addLog(`[ERROR] No se pudo conectar a ${config.SERVER_URL}`);
+    addLog(`[ERROR] No se pudo conectar a ${config.SERVER_URL} (reintentando...)`);
+  });
+
+  socket.on('disconnect', (reason) => {
+    status.connected = false;
+    status.error = "Desconectado del servidor";
+    addLog(`[ADVERTENCIA] Desconectado del servidor: ${reason}`);
+  });
+
+  socket.on('reconnect', (attemptNumber) => {
+    addLog(`[OK] ¡Reconectado con éxito! Intento #${attemptNumber}.`);
+    status.error = null;
   });
 
   socket.on('bridgeAuthenticated', (data) => {
@@ -252,13 +284,6 @@ function initSocket() {
     addLog(`[OK] Lista de impresoras sincronizada (${status.printers.length} activas).`);
   });
 
-  async function triggerPrinterSync() {
-    addLog(`Iniciando escaneo de red local...`);
-    const found = await scanLocalSubnet();
-    addLog(`Escaneo finalizado. Sincronizando ${found.length} impresoras con Gestro...`);
-    socket.emit('registerPrinters', { printers: found, locationId: config.LOCATION_ID });
-  }
-
   socket.on('print-job', (data) => {
     addLog(`Imprimiendo orden...`);
     data.jobs.forEach(job => {
@@ -268,54 +293,85 @@ function initSocket() {
   });
 }
 
+// Función global para sincronizar impresoras con escaneo por lotes (batching)
+// Se saca de initSocket para que sea accesible desde la API HTTP (/api/rescan)
+async function triggerPrinterSync() {
+  if (!socket || !socket.connected) {
+    addLog(`[ADVERTENCIA] No se puede sincronizar: Socket no conectado.`);
+    return;
+  }
+  addLog(`Iniciando escaneo de red local (optimizado)...`);
+  const found = await scanLocalSubnetOptimized();
+  addLog(`Escaneo finalizado. Sincronizando ${found.length} impresoras con Gestro...`);
+  socket.emit('registerPrinters', { printers: found, locationId: config.LOCATION_ID });
+}
+
 function connectBridge(user, pass) {
   if (!socket) initSocket();
   addLog(`Enviando login para ${user}...`);
   socket.emit('authBridge', { user, pass, locationId: config.LOCATION_ID });
 }
 
-async function scanLocalSubnet() {
+// Escaneo optimizado con concurrencia limitada para evitar bloquear el sistema
+async function scanLocalSubnetOptimized() {
   const interfaces = os.networkInterfaces();
   const discovered = [];
-  const promises = [];
-  const COMMON_PORTS = [9100, 9101]; // Industry standard for POS printers
+  const COMMON_PORTS = [9100, 9101, 9102, 8000]; // Puertos estándar y genéricos (8000)
+  const CONCURRENCY_LIMIT = 20; // Reducido aún más para mayor seguridad
 
-  // Localhost test
-  promises.push(checkPort('127.0.0.1', 9100).then(ok => { if (ok) discovered.push({ ip: '127.0.0.1', port: 9100, name: 'Local' }); }));
+  addLog("Detectando interfaces de red...");
+  console.log("DEBUG: Iniciando escaneo optimizado...");
+
+  // Prueba inicial en localhost
+  const localhostPorts = COMMON_PORTS.map(port => checkPort('127.0.0.1', port).then(ok => {
+    if (ok) discovered.push({ ip: '127.0.0.1', port, name: `Local (Puerto ${port})` });
+  }));
+  await Promise.all(localhostPorts);
 
   for (const [name, ifaces] of Object.entries(interfaces)) {
     for (const iface of ifaces) {
       if (iface.family === 'IPv4' && !iface.internal) {
         const myIp = iface.address;
         const prefix = myIp.split('.').slice(0, 3).join('.') + '.';
-        addLog(`Escaneando segmento ${prefix}x...`);
+        addLog(`Escaneando segmento ${prefix}x en puertos ${COMMON_PORTS.join(', ')}...`);
 
+        // Lista de todas las tareas pendientes (IP + Puerto)
+        const tasks = [];
         for (let i = 1; i < 255; i++) {
           const ip = prefix + i;
           if (ip === myIp) continue;
+          COMMON_PORTS.forEach(port => tasks.push({ ip, port }));
+        }
 
-          COMMON_PORTS.forEach(port => {
-            promises.push(checkPort(ip, port).then(ok => {
+        // Ejecutar tareas por lotes para no saturar Windows
+        for (let i = 0; i < tasks.length; i += CONCURRENCY_LIMIT) {
+          const batch = tasks.slice(i, i + CONCURRENCY_LIMIT);
+          console.log(`DEBUG: Procesando lote ${Math.floor(i / CONCURRENCY_LIMIT) + 1} de ${Math.ceil(tasks.length / CONCURRENCY_LIMIT)}...`);
+
+          try {
+            await Promise.all(batch.map(async (task) => {
+              const ok = await checkPort(task.ip, task.port);
               if (ok) {
-                addLog(`[OK] Impresora detectada en ${ip}:${port}`);
-                discovered.push({ ip, port, name: `Impresora ${ip}` });
+                addLog(`[OK] Impresora detectada: ${task.ip}:${task.port}`);
+                discovered.push({ ip: task.ip, port: task.port, name: `Impresora ${task.ip}` });
               }
             }));
-          });
+          } catch (batchErr) {
+            console.error(`DEBUG: Error en lote: ${batchErr.message}`);
+          }
         }
       }
     }
   }
 
-  // Wait for all checks with a total timeout protection
-  await Promise.allSettled(promises);
   return discovered;
 }
 
+// Verifica si un puerto está abierto con un timeout corto
 function checkPort(ip, port = 9100) {
   return new Promise(resolve => {
     const s = new net.Socket();
-    s.setTimeout(1200); // Slightly more time for slow networks
+    s.setTimeout(800); // Timeout reducido para acelerar el escaneo por lotes
     s.on('connect', () => { s.destroy(); resolve(true); });
     s.on('error', () => { s.destroy(); resolve(false); });
     s.on('timeout', () => { s.destroy(); resolve(false); });
@@ -325,11 +381,32 @@ function checkPort(ip, port = 9100) {
 
 function sendToPrinter(ip, port, data, name) {
   const client = new net.Socket();
+
+  // Timeout de 5 segundos para no dejar el proceso colgado si la impresora falla
+  client.setTimeout(5000);
+
   client.connect(port, ip, () => {
-    client.write(data, () => { addLog(`[EXITO] Enviado a ${name}`); client.end(); });
+    client.write(data, () => {
+      addLog(`[EXITO] Enviado a ${name}`);
+      client.end();
+    });
   });
-  client.on('error', err => addLog(`[ERROR] ${name}: ${err.message}`));
+
+  client.on('error', err => {
+    addLog(`[ERROR] ${name} (${ip}): ${err.message}`);
+    client.destroy();
+  });
+
+  client.on('timeout', () => {
+    addLog(`[ERROR] Tiempo de espera agotado en ${name} (${ip})`);
+    client.destroy();
+  });
 }
+
+// Latido (Heartbeat) para confirmar que el servicio sigue vivo cada 15 minutos
+setInterval(() => {
+  addLog(`[SISTEMA] El servicio sigue activo y monitoreando comandos.`);
+}, 15 * 60 * 1000);
 
 const { exec } = require('child_process');
 
